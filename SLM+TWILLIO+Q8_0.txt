@@ -1,0 +1,376 @@
+THIS IS THE INPLACE FILE
+https://lmarena.ai/c/9c6a55c0-17d2-43e5-9b79-ef967d6db30d
+
+
+# main.py
+import os
+import re
+import time
+import logging
+import threading
+import asyncio
+from typing import Optional
+
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse
+from twilio.twiml.voice_response import VoiceResponse, Gather
+from twilio.rest import Client
+from dotenv import load_dotenv
+import httpx
+
+from llama_cpp import Llama
+
+load_dotenv()
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger("tm-voice")
+app = FastAPI(title="TechnologyMindz Voice Assistant", version="1.0.0")
+
+# ------------------- Twilio env -------------------
+TWILIO_SID = os.getenv("TWILIO_SID", "")
+TWILIO_AUTH = os.getenv("TWILIO_AUTH", "")
+TWILIO_CALLER_ID = os.getenv("TWILIO_CALLER_ID", "")
+TWILIO_CALLBACK_URL = os.getenv("TWILIO_CALLBACK_URL", "")
+
+# ------------------- LLM config -------------------
+USE_LOCAL_LLM = os.getenv("USE_LOCAL_LLM", "1") == "1"
+
+# If you prefer remote llama.cpp server, set USE_LOCAL_LLM=0 and configure AI_SERVER_URL
+AI_SERVER_URL = os.getenv("AI_SERVER_URL", "")
+AI_API_KEY = os.getenv("AI_API_KEY", "")
+
+# Generation knobs
+AI_MAX_NEW_TOKENS = int(os.getenv("AI_MAX_NEW_TOKENS", "250"))
+AI_TEMPERATURE = float(os.getenv("AI_TEMPERATURE", "0.0"))
+AI_TOP_P = float(os.getenv("AI_TOP_P", "1.0"))
+AI_REP_PEN = float(os.getenv("AI_REP_PENALTY", "1.0"))
+AI_MAX_CHARS = int(os.getenv("AI_MAX_CHARS", "220"))
+
+# ------------------- GGUF (llama-cpp-python) -------------------
+GGUF_MODEL_PATH = os.getenv("GGUF_MODEL_PATH", "/models/model-q8_0.gguf")
+LLM_CTX = int(os.getenv("LLM_CTX", "2048"))
+LLM_THREADS = int(os.getenv("LLM_THREADS", str(os.cpu_count() or 8)))
+# -1 = offload all layers to GPU (if CUDA wheel installed); set 0 for CPU-only
+LLM_N_GPU_LAYERS = int(os.getenv("LLM_N_GPU_LAYERS", "-1"))
+
+_llama: Optional[Llama] = None
+_gen_lock = asyncio.Lock()
+
+# ------------------- HTTP client (remote fallback) -------------------
+_http_client: Optional[httpx.AsyncClient] = None
+
+async def get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=2.0, read=8.0, write=3.0, pool=8.0),
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+            http2=True,
+            headers={"Accept": "application/json", "Connection": "keep-alive"},
+        )
+    return _http_client
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    global _http_client
+    if _http_client:
+        await _http_client.aclose()
+        _http_client = None
+
+# ------------------- Twilio validation -------------------
+def validate_twilio_config() -> bool:
+    try:
+        if not (TWILIO_SID and TWILIO_AUTH):
+            logger.warning("TWILIO_SID/TWILIO_AUTH not set")
+            return False
+        client = Client(TWILIO_SID, TWILIO_AUTH)
+        client.api.accounts(TWILIO_SID).fetch()
+        logger.info("Twilio credentials valid")
+        return True
+    except Exception as e:
+        logger.error(f"Twilio validation failed: {e}")
+        return False
+
+# ------------------- Prompt helpers -------------------
+def _build_prompt(user_text: str) -> str:
+    system = (
+        "You are a represatative of technologyMindz, assume you are on call and handling "
+        "clients like a humany, just keep your natural conversation as you are answering "
+        "for the users query on the call, dont greet and introduce yourself to user until "
+        "you are asked for."
+    )
+    return f"System: {system}\nUser: {user_text}\nAssistant:"
+
+def _post_trim(text: str, max_chars: int) -> str:
+    text = (text or "").strip()
+    if len(text) <= max_chars:
+        return text
+    t = text[:max_chars]
+    if "." in t:
+        t = t[: t.rfind(".") + 1]
+    return (t.strip() or (text[:max_chars] + "...")).strip()
+
+# ------------------- Local LLM (llama-cpp-python) -------------------
+def _load_local_llm():
+    global _llama
+    if _llama is not None:
+        return
+    if not os.path.exists(GGUF_MODEL_PATH):
+        raise FileNotFoundError(f"GGUF model not found at {GGUF_MODEL_PATH}")
+    _llama = Llama(
+        model_path=GGUF_MODEL_PATH,
+        n_ctx=LLM_CTX,
+        n_threads=LLM_THREADS,
+        n_gpu_layers=LLM_N_GPU_LAYERS,
+        logits_all=False,
+        use_mmap=True,
+        use_mlock=False,
+        seed=0,
+    )
+    logger.info("GGUF model loaded via llama-cpp-python")
+
+async def local_generate(user_text: str) -> str:
+    _load_local_llm()
+    prompt = _build_prompt(user_text)
+    # Keep responses snappy for calls
+    max_new = max(8, min(AI_MAX_NEW_TOKENS, 64))
+    temperature = max(0.0, AI_TEMPERATURE)
+    top_p = min(1.0, max(0.0, AI_TOP_P))
+    repeat_penalty = max(1.0, AI_REP_PEN)
+
+    def _gen_sync() -> str:
+        out = _llama.create_completion(
+            prompt=prompt,
+            max_tokens=max_new,
+            temperature=temperature,
+            top_p=top_p,
+            repeat_penalty=repeat_penalty,
+            stop=["\nUser:", "User:", "System:", "<|system|>", "<|user|>", "<|assistant|>"],
+        )
+        text = (out["choices"][0]["text"] or "").strip()
+        return _post_trim(text, AI_MAX_CHARS) or "Sorry, I couldn't process that."
+
+    async with _gen_lock:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _gen_sync)
+
+# ------------------- Remote fallback (llama.cpp server) -------------------
+async def remote_generate(user_text: str) -> str:
+    if not AI_SERVER_URL:
+        logger.error("AI_SERVER_URL not set and USE_LOCAL_LLM=0")
+        return "Sorry, I'm not available right now."
+
+    prompt = _build_prompt(user_text)
+    max_new = max(8, min(AI_MAX_NEW_TOKENS, 64))
+
+    try:
+        client = await get_http_client()
+        headers = {"Accept": "application/json"}
+        if AI_API_KEY:
+            headers["Authorization"] = f"Bearer {AI_API_KEY}"
+
+        resp = await client.post(
+            f"{AI_SERVER_URL.rstrip('/')}/v1/completions",
+            json={
+                "model": "gguf",
+                "prompt": prompt,
+                "max_tokens": max_new,
+                "temperature": max(0.0, AI_TEMPERATURE),
+                "top_p": min(1.0, max(0.0, AI_TOP_P)),
+                "repeat_penalty": max(1.0, AI_REP_PEN),
+                "stop": ["\nUser:", "User:", "System:", "<|system|>", "<|user|>", "<|assistant|>"],
+            },
+            headers=headers,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            text = (data.get("choices", [{}])[0].get("text") or "").strip()
+            return _post_trim(text, AI_MAX_CHARS) or "Sorry, I couldn't process that."
+        else:
+            logger.error(f"AI server {resp.status_code}: {resp.text[:300]}")
+            return "Sorry, I couldn't process that."
+    except Exception as e:
+        logger.error(f"AI server error: {e}")
+        return "Sorry, I couldn't process that."
+
+# ------------------- Twilio handlers -------------------
+@app.post("/initial-greeting")
+async def initial_greeting(request: Request):
+    response = VoiceResponse()
+    gather = Gather(
+        input="speech",
+        action=f"{TWILIO_CALLBACK_URL}/gather-speech?attempt_count=0",
+        method="POST",
+        speech_timeout="1",
+        language="en-US",
+        enhanced=True,
+        barge_in=True,  # keep as in your working code
+    )
+    gather.say(
+        "Hello! This is Roney from Technology Mindz. How can I assist you today?",
+        voice="Polly.Joanna",
+    )
+    response.append(gather)
+    return Response(content=str(response), media_type="application/xml")
+
+@app.post("/gather-speech")
+async def gather_speech(request: Request):
+    form = await request.form()
+    for k, v in form.items():
+        logger.debug(f"{k}: {v}")
+
+    speech_text = str(form.get("SpeechResult") or "").strip()
+    response = VoiceResponse()
+
+    if not speech_text or len(speech_text) < 2:
+        gather = Gather(
+            input="speech",
+            action=f"{TWILIO_CALLBACK_URL}/gather-speech?attempt_count=1",
+            method="POST",
+            speech_timeout="1",
+            language="en-US",
+            enhanced=True,
+            barge_in=True,
+        )
+        gather.say("I didn't catch that. Please repeat.", voice="Polly.Joanna")
+        response.append(gather)
+        return Response(content=str(response), media_type="application/xml")
+
+    start = time.time()
+    if USE_LOCAL_LLM:
+        ai_reply = await local_generate(speech_text)
+    else:
+        ai_reply = await remote_generate(speech_text)
+    latency = time.time() - start
+    logger.info(f"[{latency:.2f}s] AI generation")
+    logger.info(f"AI Reply: {ai_reply!r}")
+
+    gather = Gather(
+        input="speech",
+        action=f"{TWILIO_CALLBACK_URL}/gather-speech?attempt_count=0",
+        method="POST",
+        speech_timeout="1",
+        language="en-US",
+        enhanced=True,
+        barge_in=True,
+    )
+    gather.say(ai_reply, voice="Polly.Joanna")
+    response.append(gather)
+    return Response(content=str(response), media_type="application/xml")
+
+def make_call_background(phone_number: str):
+    try:
+        client = Client(TWILIO_SID, TWILIO_AUTH)
+        if not phone_number.startswith("+"):
+            phone_number = "+" + phone_number
+        client.calls.create(
+            to=phone_number,
+            from_=TWILIO_CALLER_ID,
+            url=f"{TWILIO_CALLBACK_URL}/initial-greeting",
+        )
+        logger.info(f"Call initiated to {phone_number}")
+    except Exception as e:
+        logger.error(f"Error making call: {e}")
+
+@app.post("/make-call")
+async def make_call(request: Request):
+    if not validate_twilio_config():
+        return JSONResponse(status_code=500, content={"error": "Twilio config invalid"})
+    data = await request.json()
+    phone_number = data.get("to")
+    if not phone_number:
+        return JSONResponse(status_code=400, content={"error": "Phone number required"})
+    threading.Thread(target=make_call_background, args=(phone_number,), daemon=True).start()
+    return {"status": "call initiated in background"}
+
+from fastapi import APIRouter
+
+router = APIRouter()
+app.include_router(router)
+
+
+
+
+
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+AND THIS IS THE  CHAT:
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+Create a .env in the same folder as main.py. Fill with your values.
+env
+
+# Twilio (rotate your token!)
+TWILIO_SID=ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+TWILIO_AUTH=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+TWILIO_CALLER_ID=+1234567890
+# Publicly reachable URL Twilio should call (ngrok/cloud URL)
+TWILIO_CALLBACK_URL=https://your-public-url
+
+# LLM
+USE_LOCAL_LLM=1
+GGUF_MODEL_PATH=/models/model-q8_0.gguf
+LLM_CTX=2048
+LLM_THREADS=8
+LLM_N_GPU_LAYERS=-1
+
+# Gen knobs
+AI_MAX_NEW_TOKENS=250
+AI_TEMPERATURE=0.0
+AI_TOP_P=1.0
+AI_REP_PENALTY=1.0
+AI_MAX_CHARS=220
+
+# If using llama.cpp server instead of in-process:
+# USE_LOCAL_LLM=0
+# AI_SERVER_URL=http://127.0.0.1:8080
+# AI_API_KEY=
+Install deps (choose the CUDA wheel that matches your box)
+Check CUDA version:
+nvidia-smi (note the CUDA Version)
+Install:
+
+CUDA 12.4:
+pip install "llama-cpp-python-cu124>=0.2.90"
+CUDA 12.1:
+pip install "llama-cpp-python-cu121>=0.2.90"
+CPU-only:
+pip install "llama-cpp-python>=0.2.90"
+Plus app dependencies:
+
+pip install fastapi uvicorn twilio python-dotenv httpx
+Or as a single sequence (example for CUDA 12.1):
+
+Bash
+
+pip install "llama-cpp-python-cu121>=0.2.90" fastapi uvicorn twilio python-dotenv httpx
+Run command
+Assuming your model is at /models/model-q8_0.gguf and .env is in the same directory:
+Bash
+
+export PYTHONUNBUFFERED=1
+uvicorn main:app --host 0.0.0.0 --port 8000
+Minimal test before Twilio
+POST to your endpoint to simulate Twilio:
+Bash
+
+curl -X POST "http://127.0.0.1:8000/gather-speech" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  --data-urlencode "SpeechResult=How can you help a tiles company?"
+Check logs for something like “[x.xx s] AI generation”. If it’s slow, reduce AI_MAX_NEW_TOKENS to 24–64 and verify GPU offload (nvidia-smi).
+Optional: Run as llama.cpp server instead of in-process
+If you’d rather keep FastAPI lighter and talk to llama.cpp over HTTP:
+
+Build/run the server (from your llama.cpp build):
+Bash
+
+./build/bin/llama-server -m /models/model-q8_0.gguf -c 2048 -ngl -1 -t 8
+Set in .env:
+USE_LOCAL_LLM=0
+AI_SERVER_URL=http://127.0.0.1:8080
+Restart your FastAPI app. The same routes will now call the HTTP server.
+That’s it. This is the final updated code and the commands to run it on your Vast.ai GPU instance using your merged q8_0 GGUF.
